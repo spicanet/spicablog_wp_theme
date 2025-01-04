@@ -605,13 +605,13 @@ function spicablog_update_via_zip(\WP_REST_Request $request) {
     //
     // Или через переменные окружения: $github_token = getenv('GITHUB_TOKEN');
 
-    $github_token = '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'; // <-- ВПИШИТЕ СВОЙ TOKEN
+    $github_token = ''; // <-- ВПИШИТЕ СВОЙ TOKEN
 
     // 4. Скачиваем zip-архив с GitHub, используя wp_remote_get + заголовок Authorization
     // ------------------------------------------------------------------------------
     $args = [
         'headers' => [
-            'Authorization' => 'token ' . $github_token,
+            // 'Authorization' => 'token ' . $github_token,
             // При необходимости, GitHub может требовать User-Agent:
             // 'User-Agent' => 'MySiteUpdater/1.0',
         ],
