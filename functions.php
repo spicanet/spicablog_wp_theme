@@ -554,196 +554,86 @@ function spicablog_save_position_field($user_id) {
 add_action('personal_options_update', 'spicablog_save_position_field');
 add_action('edit_user_profile_update', 'spicablog_save_position_field');
 
-/**
- * Подключаем наш REST-эндпоинт под названием /wp-json/spicablog/v1/update-zip
- * Он будет вызван при вебхуке GitHub (Release, Push и т.п.).
- */
-add_action('rest_api_init', function () {
-    register_rest_route('spicablog/v1', '/update-zip', [
-        'methods'  => 'POST',
-        'callback' => 'spicablog_update_via_zip',
-        // Разрешаем доступ без авторизации WP (GitHub стучится извне)
-        'permission_callback' => '__return_true',
-    ]);
-});
+function spicablog_theme_update_check($transient) {
+    // URL сервера обновлений
+    $update_url = 'https://spicanet.net/updates/spicablog.json';
 
-/**
- * Обработчик вебхука на событие Release (или Push) для приватного репозитория.
- * Скачивает zip-архив через wp_remote_get (с токеном) и распаковывает поверх темы.
- *
- * @param  \WP_REST_Request  $request
- * @return array|\WP_REST_Response
- */
-function spicablog_update_via_zip(\WP_REST_Request $request) {
-    error_log($request->get_body());
-    // 1. Проверяем X-Hub-Signature-256, чтобы убедиться, что запрос пришёл от GitHub
-    // ------------------------------------------------------------------------------
-    $signatureHeader = $request->get_header('x-hub-signature-256');
-    $ourSecret       = 'YOUR_WEBHOOK_SECRET_123'; // Задайте свой Secret из GitHub Webhook
+    // Данные темы
+    $theme = wp_get_theme('spicablog'); // Укажите slug вашей темы
+    $current_version = $theme->get('Version');
 
-    if (!spicablog_verify_github_signature($request->get_body(), $signatureHeader, $ourSecret)) {
-        return new \WP_REST_Response(['error' => 'Invalid signature'], 403);
-    }
-
-    // 2. Извлекаем URL zip-архива из payload'а
-    // ------------------------------------------------------------------------------
-    // При событии "release" в payload обычно есть $payload['release']['zipball_url']
-    // Проверьте структуру, если используете другое событие (Push).
-    $payload = json_decode($request->get_body(), true);
-
-    if (!isset($payload['release']['zipball_url'])) {
-        return new \WP_REST_Response(['error' => 'No zip URL found in webhook payload'], 400);
-    }
-
-    $zipUrl = $payload['release']['zipball_url'];
-
-    // 3. Готовим Personal Access Token (PAT) для приватного репо
-    // ------------------------------------------------------------------------------
-    // В реальном проекте лучше хранить его в wp-config.php:
-    // define('GITHUB_PERSONAL_TOKEN', 'abc123...');
-    // $github_token = GITHUB_PERSONAL_TOKEN;
-    //
-    // Или через переменные окружения: $github_token = getenv('GITHUB_TOKEN');
-
-    $github_token = ''; // <-- ВПИШИТЕ СВОЙ TOKEN
-
-    // 4. Скачиваем zip-архив с GitHub, используя wp_remote_get + заголовок Authorization
-    // ------------------------------------------------------------------------------
-    $args = [
-        'headers' => [
-            // 'Authorization' => 'token ' . $github_token,
-            // При необходимости, GitHub может требовать User-Agent:
-            // 'User-Agent' => 'MySiteUpdater/1.0',
-        ],
-    ];
-
-    $response = wp_remote_get($zipUrl, $args);
-
+    // Получаем данные об обновлении с сервера
+    $response = wp_remote_get($update_url);
     if (is_wp_error($response)) {
-        return new \WP_REST_Response([
-            'error'   => 'Failed to download zip (wp_remote_get error)',
-            'details' => $response->get_error_message()
-        ], 500);
+        return $transient;
     }
 
-    $status_code = wp_remote_retrieve_response_code($response);
-    if ($status_code !== 200) {
-        return new \WP_REST_Response([
-            'error'  => 'Non-200 response when fetching zip',
-            'status' => $status_code,
-        ], 500);
+    $update_data = json_decode(wp_remote_retrieve_body($response), true);
+    if (!$update_data || version_compare($current_version, $update_data['version'], '>=')) {
+        return $transient; // Нет обновлений
     }
 
-    // 5. Сохраняем бинарное содержимое zip-архива во временный файл
-    // ------------------------------------------------------------------------------
-    $body      = wp_remote_retrieve_body($response);
-    $temp_file = wp_tempnam(); // создаёт уникальное имя файла в системной tmp
-    
-    if (!$temp_file) {
-        return new \WP_REST_Response([
-            'error' => 'Could not create temp file',
-        ], 500);
-    }
-
-    file_put_contents($temp_file, $body);
-
-    // 6. Распаковываем zip в ещё одну временную папку
-    // ------------------------------------------------------------------------------
-    // (так, чтобы потом скопировать файлы поверх вашей темы)
-
-    $temp_dir = wp_tempnam(); // снова имя файла, удалим и создадим директорию
-    unlink($temp_dir);
-    mkdir($temp_dir);
-
-    // unzip_file — встроенная в WP функция (wp-admin/includes/file.php)
-    $res = unzip_file($temp_file, $temp_dir);
-    if (is_wp_error($res)) {
-        return new \WP_REST_Response([
-            'error'   => 'Failed to unzip',
-            'details' => $res->get_error_message()
-        ], 500);
-    }
-
-    // 7. Ищем основную распакованную папку (GitHub обычно кладёт в /user-repo-commitHash/)
-    // ------------------------------------------------------------------------------
-    $extracted_dirs = glob($temp_dir . '/*', GLOB_ONLYDIR);
-    if (!$extracted_dirs || !isset($extracted_dirs[0])) {
-        return new \WP_REST_Response(['error' => 'No extracted folder found'], 500);
-    }
-
-    $extracted_main_folder = $extracted_dirs[0];
-
-    // Папка вашей темы (предполагаем, что slug = 'spicablog')
-    $theme_path = get_theme_root() . '/spicablog';
-
-    // 8. Копируем все файлы поверх (или можете сначала удалить старую папку)
-    // ------------------------------------------------------------------------------
-    spicablog_copy_directory($extracted_main_folder, $theme_path);
-
-    // 9. Удаляем временные файлы
-    // ------------------------------------------------------------------------------
-    unlink($temp_file);
-    // Рекурсивно удалить $temp_dir при необходимости (например, через WP_Filesystem или custom-функцию)
-
-    // 10. Возвращаем ответ
-    // ------------------------------------------------------------------------------
-    return [
-        'success' => true,
-        'zipUrl'  => $zipUrl,
+    // Добавляем данные о доступном обновлении
+    $transient->response['spicablog'] = [
+        'theme'       => 'spicablog',
+        'new_version' => $update_data['version'],
+        'url'         => $update_data['homepage'],
+        'package'     => $update_data['download_url']
     ];
+
+    return $transient;
 }
+add_filter('pre_set_site_transient_update_themes', 'spicablog_theme_update_check');
+
+// Добавляем информацию о теме на странице обновлений
+function spicablog_theme_update_details($result, $action, $args) {
+    if ($action !== 'theme_information' || $args->slug !== 'spicablog') {
+        return $result;
+    }
+
+    // URL сервера обновлений
+    $update_url = 'https://spicanet.net/updates/spicablog.json';
+    $response = wp_remote_get($update_url);
+    if (is_wp_error($response)) {
+        return $result;
+    }
+
+    $update_data = json_decode(wp_remote_retrieve_body($response), true);
+    if (!$update_data) {
+        return $result;
+    }
+
+    // Формируем данные для отображения
+    $result = [
+        'name'        => $update_data['name'],
+        'slug'        => $update_data['slug'],
+        'version'     => $update_data['version'],
+        'author'      => $update_data['author'],
+        'homepage'    => $update_data['homepage'],
+        'requires'    => $update_data['requires'],
+        'tested'      => $update_data['tested'],
+        'requires_php'=> $update_data['requires_php'],
+        'download_link'=> $update_data['download_url'],
+        'sections'    => [
+            'description' => 'Latest updates and improvements.',
+            'changelog'   => implode('<br>', $update_data['changelog'][$update_data['version']] ?? [])
+        ]
+    ];
+
+    return $result;
+}
+add_filter('themes_api', 'spicablog_theme_update_details', 10, 3);
 
 /**
- * Проверка X-Hub-Signature-256 от GitHub,
- * чтобы убедиться, что вебхук действительно пришёл от GitHub.
- *
- * @param string $payload        Тело запроса (JSON)
- * @param string $signatureHeader Заголовок X-Hub-Signature-256
- * @param string $secret          Секрет, указанный в настройках Webhook
- * @return bool
+ * Включаем автоматическое обновление темы SpicaBlog.
  */
-function spicablog_verify_github_signature($payload, $signatureHeader, $secret) {
-    if (!$signatureHeader) {
-        return false;
+function spicablog_enable_auto_updates($update, $item) {
+    // Проверяем, является ли обновление для нашей темы
+    if (isset($item->slug) && $item->slug === 'spicablog') {
+        return true; // Включаем автоматическое обновление
     }
 
-    // GitHub присылает хеш в формате: sha256=xxxxxx
-    [$algo, $hash] = explode('=', $signatureHeader, 2);
-
-    // Считаем hmac текущего payload'а с использованием нашего секрета
-    $payloadHash = hash_hmac($algo, $payload, $secret);
-
-    return hash_equals($hash, $payloadHash);
+    return $update; // Оставляем значение по умолчанию для других тем
 }
+add_filter('auto_update_theme', 'spicablog_enable_auto_updates', 10, 2);
 
-/**
- * Рекурсивное копирование всех файлов/папок из $source в $destination.
- * Сохранение структуры директорий.
- *
- * @param string $source
- * @param string $destination
- * @return void
- */
-function spicablog_copy_directory($source, $destination) {
-    if (!file_exists($destination)) {
-        mkdir($destination, 0755, true);
-    }
-    $dir = opendir($source);
-
-    while(false !== ($file = readdir($dir))) {
-        if ($file === '.' || $file === '..') {
-            continue;
-        }
-
-        $src = $source . '/' . $file;
-        $dst = $destination . '/' . $file;
-
-        if (is_dir($src)) {
-            spicablog_copy_directory($src, $dst);
-        } else {
-            copy($src, $dst);
-        }
-    }
-
-    closedir($dir);
-}
