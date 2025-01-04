@@ -562,11 +562,15 @@ function spicablog_theme_update_check($transient) {
     $theme = wp_get_theme('spicablog'); // Укажите slug вашей темы
     $current_version = $theme->get('Version');
 
+    error_log('Current version: ' . $current_version);
+
     // Получаем данные об обновлении с сервера
     $response = wp_remote_get($update_url);
     if (is_wp_error($response)) {
         return $transient;
     }
+
+    error_log('Server response: ' . wp_remote_retrieve_body($response));
 
     $update_data = json_decode(wp_remote_retrieve_body($response), true);
     if (!$update_data || version_compare($current_version, $update_data['version'], '>=')) {
@@ -597,6 +601,8 @@ function spicablog_theme_update_details($result, $action, $args) {
     if (is_wp_error($response)) {
         return $result;
     }
+
+    error_log('Response: ' . print_r($response, true));
 
     $update_data = json_decode(wp_remote_retrieve_body($response), true);
     if (!$update_data) {
